@@ -3,7 +3,7 @@ plugins {
 }
 
 dependencies {
-    api 'commons-io:commons-io:2.20.0'
+    api 'commons-io:commons-io:2.22.0'
     api 'org.apache.commons:commons-text:1.10.0' // 1.10.0 uses Range.between (compatible with MC 1.20.1's commons-lang3 3.12.0); 1.11+ needs Range.of from commons-lang3 3.13+
     api 'net.william278:minedown:1.8.2'
     api 'net.william278:mapdataapi:2.0'
