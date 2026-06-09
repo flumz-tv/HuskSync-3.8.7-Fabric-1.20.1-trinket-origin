@@ -73,6 +73,55 @@ remapJar {
 
     destinationDirectory.set(file("$rootDir/target/"))
     archiveClassifier.set('')
+
+    // Fix upstream packaging bug in uniform-fabric:1.3.9+1.20.1: its uniform.mixins.json
+    // requires ArgumentNodeMixin, but that mixin is guarded //#if MC>=12108 so the class
+    // is never compiled for 1.20.1 -> server crashes during mixin PREPARE. The mixin is not
+    // needed on 1.20.1; strip it from the nested jar's server mixin list.
+    doLast {
+        if (project.name != '1.20.1') {
+            return
+        }
+        def outerJar = archiveFile.get().asFile
+        def work = new File(temporaryDir, 'uniformPatch')
+        project.delete(work)
+        work.mkdirs()
+        project.copy {
+            from project.zipTree(outerJar)
+            include 'META-INF/jars/uniform-fabric-*.jar'
+            into work
+        }
+        def nested = project.fileTree(work) { include 'META-INF/jars/uniform-fabric-*.jar' }.files
+        if (nested.isEmpty()) {
+            logger.warn('[uniform-patch] no nested uniform jar found, skipping')
+            return
+        }
+        def nestedJar = nested.iterator().next()
+        def fixDir = new File(work, 'fix')
+        fixDir.mkdirs()
+        new File(fixDir, 'uniform.mixins.json').text = '''{
+  "required": false,
+  "minVersion": "0.8",
+  "package": "net.william278.uniform.fabric.mixins",
+  "compatibilityLevel": "JAVA_17",
+  "server": [],
+  "injectors": {
+    "defaultRequire": 1
+  }
+}
+'''
+        // Replace uniform.mixins.json inside the nested uniform jar
+        project.ant.zip(destfile: nestedJar, update: true) {
+            fileset(dir: fixDir) { include(name: 'uniform.mixins.json') }
+        }
+        // Replace the nested uniform jar inside the remapped mod jar
+        project.ant.zip(destfile: outerJar, update: true) {
+            zipfileset(dir: nestedJar.parentFile, prefix: 'META-INF/jars') {
+                include(name: nestedJar.name)
+            }
+        }
+        logger.lifecycle("[uniform-patch] stripped ArgumentNodeMixin from ${nestedJar.name} in ${outerJar.name}")
+    }
 }
 
 shadowJar.finalizedBy(remapJar)
