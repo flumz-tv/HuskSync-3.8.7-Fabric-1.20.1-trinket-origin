@@ -626,21 +626,32 @@ public abstract class FabricData implements Data {
         // there is no compile-time dependency on the CCA API: it only runs at runtime where
         // CCA is present, and degrades silently (data stays restored server-side) otherwise.
         private static void resync(@NotNull ServerPlayerEntity player) {
-            try {
-                final Object container = player.getClass()
-                        .getMethod("getComponentContainer").invoke(player);
-                final Object keys = container.getClass().getMethod("keys").invoke(container);
-                for (Object key : (java.util.Set<?>) keys) {
-                    try {
-                        key.getClass().getMethod("sync", Object.class).invoke(key, player);
-                    } catch (Throwable ignored) {
-                        // component not syncable: ignore
-                    }
-                }
-            } catch (Throwable ignored) {
-                // CCA absent or API differs: data already restored server-side,
-                // the client refreshes on the next relog.
+            final net.minecraft.server.MinecraftServer server = player.getServer();
+            if (server == null) {
+                return;
             }
+            // Re-send the components on the MAIN server thread, next tick. Sending packets off
+            // the server thread, or mid-way through the join/sync sequence before the player's
+            // network handler is ready, can cause a CustomPayloadS2CPacket buffer to be released
+            // early (Netty "IllegalReferenceCountException: refCnt: 0" -> client kicked with an
+            // Internal Exception). Deferring to the main thread sends them in a clean context.
+            server.execute(() -> {
+                try {
+                    final Object container = player.getClass()
+                            .getMethod("getComponentContainer").invoke(player);
+                    final Object keys = container.getClass().getMethod("keys").invoke(container);
+                    for (Object key : (java.util.Set<?>) keys) {
+                        try {
+                            key.getClass().getMethod("sync", Object.class).invoke(key, player);
+                        } catch (Throwable ignored) {
+                            // component not syncable: ignore
+                        }
+                    }
+                } catch (Throwable ignored) {
+                    // CCA absent or API differs: data already restored server-side,
+                    // the client refreshes on the next relog.
+                }
+            });
         }
 
     }
