@@ -595,14 +595,21 @@ public abstract class FabricData implements Data {
                 return;
             }
             try {
-                // readNbt only reads keys present (everything is guarded by contains()), so a
-                // wrapper holding only cardinal_components touches only CCA. Then re-sync to the
-                // client (otherwise the trinkets screen / origin stay empty until the next relog,
-                // as CCA syncs the client BEFORE this restoration). NBT entity API is 1.20.1-only;
-                // other MC versions compile to a no-op (this build only targets 1.20.1).
+                // player.readNbt() reads the WHOLE entity NBT, and crucially NOT every key is
+                // guarded: PlayerInventory.readNbt() clears main/armor/offhand and the ender chest
+                // BEFORE repopulating from the "Inventory"/"EnderItems" lists. A wrapper holding
+                // only cardinal_components has no "Inventory" key, so getList(...) returns an empty
+                // list and the player's (already-synced) inventory + armor get WIPED. To avoid
+                // that, capture the player's CURRENT full NBT first and overlay only the
+                // cardinal_components tag, so readNbt restores everything unchanged plus CCA.
+                // Then re-sync to the client (otherwise the trinkets screen / origin stay empty
+                // until the next relog, as CCA syncs the client BEFORE this restoration). NBT
+                // entity API is 1.20.1-only; other MC versions compile to a no-op (this build
+                // only targets 1.20.1).
                 //#if MC==12001
                 //$$ final net.minecraft.nbt.NbtCompound cca = net.minecraft.nbt.StringNbtReader.parse(components);
                 //$$ final net.minecraft.nbt.NbtCompound wrapper = new net.minecraft.nbt.NbtCompound();
+                //$$ player.writeNbt(wrapper);
                 //$$ wrapper.put(CCA_NBT_KEY, cca);
                 //$$ player.readNbt(wrapper);
                 //$$ resync(player);
