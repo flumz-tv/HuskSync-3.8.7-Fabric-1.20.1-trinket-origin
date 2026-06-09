@@ -588,14 +588,27 @@ public abstract class FabricData implements Data {
         /**
          * APPLICATION: restores the CCA sub-tag then re-syncs to the client.
          */
-        // Kill switch: start the server with -Dhusksync.cca.disableApply=true to skip restoring
-        // Cardinal Components data. Diagnostic / opt-out for when CCA's own client sync misbehaves
-        // (e.g. CustomPayloadS2CPacket "refCnt: 0" on a heavily overloaded server).
-        private static final boolean APPLY_DISABLED = Boolean.getBoolean("husksync.cca.disableApply");
+        // Kill switch to skip restoring Cardinal Components data. Diagnostic / opt-out for when
+        // CCA's own client sync misbehaves. Enabled by EITHER the JVM property
+        // -Dhusksync.cca.disableApply=true OR by creating an empty file named
+        // "husksync-disable-cca.flag" in the server's working directory (easier on hosts where
+        // JVM flags can't be set). Checked each apply (rare: only on a sync).
+        private static final boolean APPLY_DISABLED_PROP = Boolean.getBoolean("husksync.cca.disableApply");
+
+        private static boolean isApplyDisabled() {
+            if (APPLY_DISABLED_PROP) {
+                return true;
+            }
+            try {
+                return java.nio.file.Files.exists(java.nio.file.Path.of("husksync-disable-cca.flag"));
+            } catch (Throwable t) {
+                return false;
+            }
+        }
 
         @Override
         public void apply(@NotNull FabricUser user, @NotNull FabricHuskSync plugin) {
-            if (APPLY_DISABLED) {
+            if (isApplyDisabled()) {
                 return;
             }
             final ServerPlayerEntity player = user.getPlayer();
