@@ -602,17 +602,19 @@ public abstract class FabricData implements Data {
                 // list and the player's (already-synced) inventory + armor get WIPED. To avoid
                 // that, capture the player's CURRENT full NBT first and overlay only the
                 // cardinal_components tag, so readNbt restores everything unchanged plus CCA.
-                // Then re-sync to the client (otherwise the trinkets screen / origin stay empty
-                // until the next relog, as CCA syncs the client BEFORE this restoration). NBT
-                // entity API is 1.20.1-only; other MC versions compile to a no-op (this build
-                // only targets 1.20.1).
+                // The full readNbt reloads the components through CCA's own load path, which
+                // also refreshes the client. We deliberately do NOT call the manual resync()
+                // here: doing both made CCA send each component twice, and the shared
+                // CustomPayloadS2CPacket buffer was released after the first send, throwing
+                // Netty "IllegalReferenceCountException: refCnt: 0" and kicking the player on
+                // every join. NBT entity API is 1.20.1-only; other MC versions compile to a
+                // no-op (this build only targets 1.20.1).
                 //#if MC==12001
                 //$$ final net.minecraft.nbt.NbtCompound cca = net.minecraft.nbt.StringNbtReader.parse(components);
                 //$$ final net.minecraft.nbt.NbtCompound wrapper = new net.minecraft.nbt.NbtCompound();
                 //$$ player.writeNbt(wrapper);
                 //$$ wrapper.put(CCA_NBT_KEY, cca);
                 //$$ player.readNbt(wrapper);
-                //$$ resync(player);
                 //#endif
             } catch (Throwable e) {
                 plugin.log(java.util.logging.Level.WARNING,
