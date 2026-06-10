@@ -615,33 +615,75 @@ public abstract class FabricData implements Data {
             if (components == null || components.isBlank() || components.equals("{}")) {
                 return;
             }
-            try {
-                // player.readNbt() reads the WHOLE entity NBT, and crucially NOT every key is
-                // guarded: PlayerInventory.readNbt() clears main/armor/offhand and the ender chest
-                // BEFORE repopulating from the "Inventory"/"EnderItems" lists. A wrapper holding
-                // only cardinal_components has no "Inventory" key, so getList(...) returns an empty
-                // list and the player's (already-synced) inventory + armor get WIPED. To avoid
-                // that, capture the player's CURRENT full NBT first and overlay only the
-                // cardinal_components tag, so readNbt restores everything unchanged plus CCA.
-                // The full readNbt reloads the components through CCA's own load path, which
-                // also refreshes the client. We deliberately do NOT call the manual resync()
-                // here: doing both made CCA send each component twice, and the shared
-                // CustomPayloadS2CPacket buffer was released after the first send, throwing
-                // Netty "IllegalReferenceCountException: refCnt: 0" and kicking the player on
-                // every join. NBT entity API is 1.20.1-only; other MC versions compile to a
-                // no-op (this build only targets 1.20.1).
-                //#if MC==12001
-                //$$ final net.minecraft.nbt.NbtCompound cca = net.minecraft.nbt.StringNbtReader.parse(components);
-                //$$ final net.minecraft.nbt.NbtCompound wrapper = new net.minecraft.nbt.NbtCompound();
-                //$$ player.writeNbt(wrapper);
-                //$$ wrapper.put(CCA_NBT_KEY, cca);
-                //$$ player.readNbt(wrapper);
-                //#endif
-            } catch (Throwable e) {
-                plugin.log(java.util.logging.Level.WARNING,
-                        "[CCA] Failed to apply cardinal_components to "
-                                + player.getGameProfile().getName(), e);
-            }
+            // STRATEGY: load each CCA component individually via readFromNbt(), deferred
+            // to the NEXT server tick. Two reasons for deferring:
+            //
+            // 1. Some CCA component readFromNbt() implementations internally call sync()
+            //    which sends CustomPayloadS2CPacket. During the join sequence (especially
+            //    Velocity server switches) the Netty pipeline may not be ready yet, causing
+            //    the PacketByteBuf to be released prematurely → refCnt: 0 → player kicked.
+            //
+            // 2. By deferring to the next tick, the player's network handler is fully
+            //    established, so any sync packets triggered by readFromNbt() can be
+            //    encoded and sent without buffer lifecycle issues.
+            //
+            // We use CompletableFuture.runAsync() to hop to a background thread, then
+            // srv.execute() to queue back onto the server thread for the NEXT tick.
+            // (Calling srv.execute() from the server thread runs IMMEDIATELY due to
+            // ReentrantThreadExecutor short-circuiting.)
+            //#if MC==12001
+            //$$ final net.minecraft.server.MinecraftServer srv = player.getServer();
+            //$$ if (srv == null) return;
+            //$$ final String componentsSafe = components;
+            //$$ java.util.concurrent.CompletableFuture.runAsync(() ->
+            //$$     srv.execute(() -> {
+            //$$         try {
+            //$$             final net.minecraft.nbt.NbtCompound cca =
+            //$$                     net.minecraft.nbt.StringNbtReader.parse(componentsSafe);
+            //$$             if (cca.isEmpty()) return;
+            //$$             final Object container = player.getClass()
+            //$$                     .getMethod("getComponentContainer").invoke(player);
+            //$$             final Iterable<?> keys = (Iterable<?>) container.getClass()
+            //$$                     .getMethod("keys").invoke(container);
+            //$$             for (Object key : keys) {
+            //$$                 try {
+            //$$                     final net.minecraft.util.Identifier id =
+            //$$                             (net.minecraft.util.Identifier) key.getClass()
+            //$$                                     .getMethod("getId").invoke(key);
+            //$$                     final String idStr = id.toString();
+            //$$                     if (!cca.contains(idStr)) continue;
+            //$$                     final net.minecraft.nbt.NbtCompound compNbt = cca.getCompound(idStr);
+            //$$                     if (compNbt.isEmpty()) continue;
+            //$$                     Object component = null;
+            //$$                     for (java.lang.reflect.Method m : key.getClass().getMethods()) {
+            //$$                         if ("get".equals(m.getName()) && m.getParameterCount() == 1) {
+            //$$                             try { component = m.invoke(key, player); break; }
+            //$$                             catch (Throwable ignored) {}
+            //$$                         }
+            //$$                     }
+            //$$                     if (component == null) continue;
+            //$$                     for (java.lang.reflect.Method m : component.getClass().getMethods()) {
+            //$$                         if ("readFromNbt".equals(m.getName())
+            //$$                                 && m.getParameterCount() == 1
+            //$$                                 && m.getParameterTypes()[0].isAssignableFrom(
+            //$$                                         net.minecraft.nbt.NbtCompound.class)) {
+            //$$                             m.invoke(component, compNbt);
+            //$$                             plugin.debug("[CCA] Restored component: " + idStr);
+            //$$                             break;
+            //$$                         }
+            //$$                     }
+            //$$                 } catch (Throwable e) {
+            //$$                     plugin.debug("[CCA] Failed to restore component " + key, e);
+            //$$                 }
+            //$$             }
+            //$$         } catch (Throwable e) {
+            //$$             plugin.log(java.util.logging.Level.WARNING,
+            //$$                     "[CCA] Failed to apply cardinal_components to "
+            //$$                             + player.getGameProfile().getName(), e);
+            //$$         }
+            //$$     })
+            //$$ );
+            //#endif
         }
 
         // Forces a server -> client re-sync of every Cardinal component attached to the
@@ -1080,6 +1122,344 @@ public abstract class FabricData implements Data {
             player.sendAbilitiesUpdate();
         }
 
+    }
+
+    /**
+     * Synchronises the contents of every Sophisticated Backpack carried by the player.
+     *
+     * <p>Sophisticated Backpacks stores item contents in a world-level SavedData file
+     * ({@code world/data/sophisticatedbackpacks.dat}) keyed by a UUID written into the
+     * item's NBT tag ({@code storage_uuid}).  HuskSync's normal inventory sync therefore
+     * only transfers the UUID reference; the actual slots live on the source server's disk.
+     *
+     * <p>This handler solves the problem by:
+     * <ol>
+     *   <li><b>Capture</b> – scanning the player's inventory for SB items, reading their
+     *       contents from {@code BackpackStorage} via reflection and serialising each
+     *       {@code NbtCompound} as SNBT in the snapshot.</li>
+     *   <li><b>Apply</b> – writing every (UUID → NbtCompound) pair back into the target
+     *       server's {@code BackpackStorage}, so the UUID already on the synced item
+     *       resolves correctly.</li>
+     * </ol>
+     *
+     * <p>All {@code BackpackStorage} calls go through reflection so that there is
+     * <em>zero compile-time dependency</em> on Sophisticated Backpacks.  The class
+     * degrades silently if the mod is absent.
+     *
+     * <p>Only active on MC 1.20.1 (NBT item tags); other versions compile to no-ops.
+     */
+    @Getter
+    @Setter
+    @AllArgsConstructor(access = AccessLevel.PRIVATE)
+    @NoArgsConstructor(access = AccessLevel.PRIVATE)
+    public static class SophisticatedBackpacks extends FabricData implements Adaptable {
+
+        /** NBT key inside the item tag that holds the backpack's storage UUID.
+         *  Verified from live NBT dump: SB Fabric 1.20.1 uses "contentsUuid" (IntArray). */
+        private static final String NBT_STORAGE_UUID_KEY = "contentsUuid";
+
+        /** NBT key inside the contents compound that holds the inventory list. */
+        private static final String NBT_INVENTORY_KEY = "inventory";
+
+        /** NBT key inside the inventory compound that holds the item list. */
+        private static final String NBT_ITEMS_KEY = "Items";
+
+        /** Fully-qualified class name of BackpackStorage (resolved at runtime). */
+        private static final String STORAGE_CLASS =
+                "net.p3pp3rf1y.sophisticatedbackpacks.backpack.BackpackStorage";
+
+        /**
+         * Custom identifier – namespace != "husksync" so it is treated as custom data
+         * (always enabled when registered).  Applied AFTER inventory so the UUID already
+         * sits on the restored item before we write the contents into BackpackStorage.
+         */
+        public static final net.william278.husksync.data.Identifier IDENTIFIER =
+                net.william278.husksync.data.Identifier.from(
+                        "husksync_sb", "sophisticated_backpacks",
+                        Set.of(
+                                net.william278.husksync.data.Identifier.Dependency.optional(
+                                        net.kyori.adventure.key.Key.key("husksync", "inventory"))
+                        )
+                );
+
+        /** Map of {@code UUID.toString()} → SNBT string of the backpack contents. */
+        @SerializedName("backpacks")
+        private Map<String, String> backpacks;
+
+        // ── Capture ──────────────────────────────────────────────────────────────────
+
+        @NotNull
+        public static FabricData.SophisticatedBackpacks adapt(
+                @NotNull ServerPlayerEntity player,
+                @NotNull FabricHuskSync plugin) {
+            final Map<String, String> result = new java.util.LinkedHashMap<>();
+            //#if MC==12001
+            //$$ try {
+            //$$     final Object storage = resolveStorage(player.getServer(), plugin);
+            //$$     if (storage == null) {
+            //$$         return new SophisticatedBackpacks(result);
+            //$$     }
+            //$$     final net.minecraft.entity.player.PlayerInventory inv = player.getInventory();
+            //$$     for (int i = 0; i < inv.size(); i++) {
+            //$$         collectFromStack(inv.getStack(i), storage, result, plugin);
+            //$$     }
+            //$$ } catch (Throwable e) {
+            //$$     plugin.log(java.util.logging.Level.WARNING,
+            //$$             "[SB] Failed to capture backpack data for "
+            //$$                     + player.getGameProfile().getName(), e);
+            //$$ }
+            //#endif
+            return new SophisticatedBackpacks(result);
+        }
+
+        //#if MC==12001
+        //$$ /**
+        //$$  * Reads the backpack contents for one item stack (if it is a SB item) and adds
+        //$$  * them to {@code result}.  Recurses into nested backpacks.
+        //$$ */
+        //$$ private static void collectFromStack(
+        //$$         @NotNull net.minecraft.item.ItemStack stack,
+        //$$         @NotNull Object storage,
+        //$$         @NotNull Map<String, String> result,
+        //$$         @NotNull FabricHuskSync plugin) {
+        //$$     if (stack.isEmpty()) return;
+        //$$     final net.minecraft.nbt.NbtCompound nbt = stack.getNbt();
+        //$$     if (nbt == null) return;
+        //$$     // SB stores the UUID as an IntArray [I;a,b,c,d] under "contentsUuid".
+        //$$     // Use containsUuid() first; fall back to manual IntArray extraction.
+        //$$     UUID uuid = null;
+        //$$     if (nbt.containsUuid(NBT_STORAGE_UUID_KEY)) {
+        //$$         uuid = nbt.getUuid(NBT_STORAGE_UUID_KEY);
+        //$$     } else if (nbt.contains(NBT_STORAGE_UUID_KEY,
+        //$$             net.minecraft.nbt.NbtElement.INT_ARRAY_TYPE)) {
+        //$$         // Manual fallback: IntArray of 4 ints → UUID via NbtHelper
+        //$$         try {
+        //$$             uuid = net.minecraft.nbt.NbtHelper.toUuid(
+        //$$                     nbt.get(NBT_STORAGE_UUID_KEY));
+        //$$         } catch (Throwable ignored) {}
+        //$$     }
+        //$$     if (uuid == null) return;
+        //$$     if (result.containsKey(uuid.toString())) return; // already collected
+        //$$     try {
+        //$$         final net.minecraft.nbt.NbtCompound contents = readContents(storage, uuid);
+        //$$         if (contents == null || contents.isEmpty()) return;
+        //$$         // Recurse into items nested inside this backpack before storing it
+        //$$         final net.minecraft.nbt.NbtCompound invTag =
+        //$$                 contents.getCompound(NBT_INVENTORY_KEY);
+        //$$         final net.minecraft.nbt.NbtList items = invTag.getList(
+        //$$                 NBT_ITEMS_KEY, net.minecraft.nbt.NbtElement.COMPOUND_TYPE);
+        //$$         for (int i = 0; i < items.size(); i++) {
+        //$$             try {
+        //$$                 collectFromStack(
+        //$$                         net.minecraft.item.ItemStack.fromNbt(items.getCompound(i)),
+        //$$                         storage, result, plugin);
+        //$$             } catch (Throwable ignored) {}
+        //$$         }
+        //$$         result.put(uuid.toString(), contents.toString()); // SNBT
+        //$$     } catch (Throwable e) {
+        //$$         plugin.debug("[SB] Failed to read contents for UUID " + uuid, e);
+        //$$     }
+        //$$ }
+        //$$
+        //$$ /**
+        //$$  * Reads the contents compound for a given UUID.
+        //$$  * Prefers {@code getBackpackContents(UUID)} (returns Optional, read-only) and
+        //$$  * falls back to {@code getOrCreateBackpackContents(UUID)} if that method does
+        //$$  * not exist in this build of the mod.
+        //$$ */
+        //$$ private static volatile java.lang.reflect.Method cachedReadMethod;
+        //$$ private static volatile boolean readMethodResolved = false;
+        //$$
+        //$$ @Nullable
+        //$$ private static net.minecraft.nbt.NbtCompound readContents(
+        //$$         @NotNull Object storage, @NotNull UUID uuid) throws Throwable {
+        //$$     if (!readMethodResolved) {
+        //$$         readMethodResolved = true;
+        //$$         try {
+        //$$             cachedReadMethod = storage.getClass()
+        //$$                     .getMethod("getBackpackContents", UUID.class);
+        //$$         } catch (NoSuchMethodException ignored) {
+        //$$             try {
+        //$$                 cachedReadMethod = storage.getClass()
+        //$$                         .getMethod("getOrCreateBackpackContents", UUID.class);
+        //$$             } catch (NoSuchMethodException ignored2) {}
+        //$$         }
+        //$$     }
+        //$$     if (cachedReadMethod == null) return null;
+        //$$     final Object result = cachedReadMethod.invoke(storage, uuid);
+        //$$     if (result instanceof java.util.Optional<?> opt) {
+        //$$         return opt.isPresent() ? (net.minecraft.nbt.NbtCompound) opt.get() : null;
+        //$$     }
+        //$$     return (net.minecraft.nbt.NbtCompound) result;
+        //$$ }
+        //#endif
+
+        // ── Apply ─────────────────────────────────────────────────────────────────────
+
+        @Override
+        public void apply(@NotNull FabricUser user, @NotNull FabricHuskSync plugin) {
+            if (backpacks == null || backpacks.isEmpty()) return;
+            final ServerPlayerEntity player = user.getPlayer();
+            final MinecraftServer server = player.getServer();
+            if (server == null) return;
+            // Write contents SYNCHRONOUSLY on the current (main server) thread.
+            //
+            // DO NOT defer via server.execute() here. HuskSync already calls apply() on
+            // the main server thread. Deferring to the next tick would let SB's own
+            // inventory-sync code access the backpack UUID first, find no entry in
+            // BackpackStorage, create an empty cache entry, and then our write would be
+            // silently shadowed by that cached-empty version – causing the "contents flash
+            // then disappear" symptom. Writing synchronously ensures the contents are in
+            // BackpackStorage before Minecraft sends the inventory packet to the client.
+            try {
+                final Object storage = resolveStorage(server, plugin);
+                if (storage == null) {
+                    plugin.log(java.util.logging.Level.WARNING,
+                            "[SB] BackpackStorage unavailable – cannot restore backpack "
+                                    + "contents for " + player.getGameProfile().getName());
+                    return;
+                }
+                // setBackpackContents(UUID, NbtCompound) does not exist in this port.
+                // Instead we use getOrCreateBackpackContents(UUID) which returns a mutable
+                // reference to the stored NbtCompound, then replace its content in-place
+                // and call markDirty() so the change is persisted.
+                final java.lang.reflect.Method getOrCreate =
+                        findMethod(storage.getClass(), "getOrCreateBackpackContents", UUID.class);
+                if (getOrCreate == null) {
+                    plugin.log(java.util.logging.Level.WARNING,
+                            "[SB] getOrCreateBackpackContents not found on "
+                                    + storage.getClass().getName());
+                    return;
+                }
+                for (Map.Entry<String, String> entry : backpacks.entrySet()) {
+                    try {
+                        final UUID uuid = UUID.fromString(entry.getKey());
+                        //#if MC==12001
+                        //$$ final net.minecraft.nbt.NbtCompound src =
+                        //$$     net.minecraft.nbt.StringNbtReader.parse(entry.getValue());
+                        //$$ final net.minecraft.nbt.NbtCompound dest =
+                        //$$     (net.minecraft.nbt.NbtCompound) getOrCreate.invoke(storage, uuid);
+                        //$$ // Clear existing content and copy ours in-place
+                        //$$ for (String k : new java.util.HashSet<>(dest.getKeys())) {
+                        //$$     dest.remove(k);
+                        //$$ }
+                        //$$ for (String k : src.getKeys()) {
+                        //$$     dest.put(k, src.get(k).copy());
+                        //$$ }
+                        //$$ plugin.debug("[SB] Restored backpack UUID " + uuid);
+                        //#endif
+                    } catch (Throwable e) {
+                        plugin.debug("[SB] Failed to restore UUID " + entry.getKey(), e);
+                    }
+                }
+                // markDirty() is inherited from PersistentState – always present
+                try {
+                    storage.getClass().getMethod("markDirty").invoke(storage);
+                } catch (Throwable ignored) {}
+            } catch (Throwable e) {
+                plugin.log(java.util.logging.Level.WARNING,
+                        "[SB] Failed to apply backpack data for "
+                                + player.getGameProfile().getName(), e);
+            }
+        }
+
+        // ── Reflection helpers ────────────────────────────────────────────────────────
+
+        /**
+         * Resolves the live {@code BackpackStorage} instance via reflection.
+         * Tries three call signatures in order:
+         * <ol>
+         *   <li>{@code BackpackStorage.get(MinecraftServer)}</li>
+         *   <li>{@code BackpackStorage.get(ServerWorld)} (passes overworld)</li>
+         *   <li>{@code BackpackStorage.get()} (no-arg singleton)</li>
+         * </ol>
+         * Logs diagnostics (class not found, available methods) to help identify
+         * naming differences across mod versions.
+         */
+        /** Cached reflection accessor for BackpackStorage.get(). Resolved once. */
+        private static volatile java.lang.reflect.Method cachedGetMethod;
+        private static volatile boolean storageResolved = false;
+
+        @Nullable
+        private static Object resolveStorage(
+                @Nullable MinecraftServer server,
+                @Nullable FabricHuskSync plugin) {
+            if (server == null) return null;
+            // Fast path: use cached method after first resolution
+            if (storageResolved) {
+                if (cachedGetMethod == null) return null;
+                try {
+                    if (cachedGetMethod.getParameterCount() == 0) {
+                        return cachedGetMethod.invoke(null);
+                    } else if (cachedGetMethod.getParameterTypes()[0] == MinecraftServer.class) {
+                        return cachedGetMethod.invoke(null, server);
+                    } else {
+                        return cachedGetMethod.invoke(null, server.getOverworld());
+                    }
+                } catch (Throwable e) { return null; }
+            }
+            // First call: resolve via reflection and cache
+            storageResolved = true;
+            try {
+                final Class<?> cls = Class.forName(STORAGE_CLASS);
+                if (plugin != null) {
+                    final StringBuilder methods = new StringBuilder();
+                    for (java.lang.reflect.Method m : cls.getMethods()) {
+                        if (m.getParameterCount() <= 1) {
+                            methods.append(m.getName()).append('(');
+                            for (Class<?> p : m.getParameterTypes()) {
+                                methods.append(p.getSimpleName());
+                            }
+                            methods.append(") ");
+                        }
+                    }
+                    plugin.debug("[SB] BackpackStorage class found. Methods: " + methods);
+                }
+                // Try signatures in order and cache the working one
+                try {
+                    cachedGetMethod = cls.getMethod("get", MinecraftServer.class);
+                    return cachedGetMethod.invoke(null, server);
+                } catch (NoSuchMethodException ignored) {}
+                try {
+                    cachedGetMethod = cls.getMethod("get",
+                            net.minecraft.server.world.ServerWorld.class);
+                    return cachedGetMethod.invoke(null, server.getOverworld());
+                } catch (NoSuchMethodException ignored) {}
+                try {
+                    cachedGetMethod = cls.getMethod("get");
+                    return cachedGetMethod.invoke(null);
+                } catch (NoSuchMethodException ignored) {}
+                if (plugin != null) {
+                    plugin.log(java.util.logging.Level.WARNING,
+                            "[SB] No matching get() method found on " + cls.getName());
+                }
+            } catch (ClassNotFoundException e) {
+                if (plugin != null) {
+                    plugin.log(java.util.logging.Level.WARNING,
+                            "[SB] BackpackStorage class not found: " + STORAGE_CLASS
+                                    + " – is the mod loaded?");
+                }
+            } catch (Throwable e) {
+                if (plugin != null) {
+                    plugin.log(java.util.logging.Level.WARNING,
+                            "[SB] resolveStorage failed", e);
+                }
+            }
+            return null;
+        }
+
+        /** Looks up a method by name + parameter types (public or declared). */
+        @Nullable
+        private static java.lang.reflect.Method findMethod(
+                @NotNull Class<?> cls,
+                @NotNull String name,
+                @NotNull Class<?>... params) {
+            try { return cls.getMethod(name, params); }
+            catch (NoSuchMethodException ignored) {}
+            try { return cls.getDeclaredMethod(name, params); }
+            catch (NoSuchMethodException ignored) {}
+            return null;
+        }
     }
 
 }

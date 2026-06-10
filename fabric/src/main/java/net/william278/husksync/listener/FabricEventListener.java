@@ -20,6 +20,7 @@
 package net.william278.husksync.listener;
 
 import net.fabricmc.fabric.api.entity.event.v1.ServerLivingEntityEvents;
+import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
 import net.fabricmc.fabric.api.event.player.PlayerBlockBreakEvents;
 import net.fabricmc.fabric.api.event.player.UseBlockCallback;
 import net.fabricmc.fabric.api.event.player.UseEntityCallback;
@@ -69,6 +70,13 @@ public class FabricEventListener extends EventListener implements LockedHandler 
         WorldSaveCallback.EVENT.register(this::handleWorldSave);
         PlayerDeathDropsCallback.EVENT.register(this::handlePlayerDeathDrops);
 
+        // Pre-capture Sophisticated Backpacks data every tick on the Server thread.
+        // BackpackStorage (a PersistentState) only returns valid data on the main
+        // thread. The DISCONNECT callback fires on the Netty IO thread (too late),
+        // and the async HuskSync-ThreadPool save also can't access it. By refreshing
+        // the cache every tick we guarantee fresh data is available for any save.
+        ServerTickEvents.END_SERVER_TICK.register(this::preCacheSophisticatedBackpacks);
+
         // Locked events handling
         ItemPickupCallback.EVENT.register(this::handleItemPickup);
         ItemDropCallback.EVENT.register(this::handleItemDrop);
@@ -79,6 +87,30 @@ public class FabricEventListener extends EventListener implements LockedHandler 
         ServerLivingEntityEvents.ALLOW_DAMAGE.register(this::handleEntityDamage);
         InventoryClickCallback.EVENT.register(this::handleInventoryClick);
         PlayerCommandCallback.EVENT.register(this::handlePlayerCommand);
+    }
+
+    /**
+     * Runs every tick on the Server thread. For each online player carrying a
+     * Sophisticated Backpack, captures its contents from BackpackStorage and
+     * stashes them in the player's custom data store so they are available for
+     * the async disconnect/save path. Runs every tick to minimize stale data
+     * when a player switches servers quickly after modifying backpack contents.
+     */
+    private void preCacheSophisticatedBackpacks(@NotNull MinecraftServer server) {
+        final FabricHuskSync hs = (FabricHuskSync) plugin;
+        if (!hs.getSerializers().containsKey(FabricData.SophisticatedBackpacks.IDENTIFIER)) {
+            return;
+        }
+        for (FabricUser user : hs.getPlayerMap().values()) {
+            try {
+                final FabricData.SophisticatedBackpacks sbData =
+                        FabricData.SophisticatedBackpacks.adapt(user.getPlayer(), hs);
+                if (sbData.getBackpacks() != null && !sbData.getBackpacks().isEmpty()) {
+                    hs.getPlayerCustomDataStore(user)
+                            .put(FabricData.SophisticatedBackpacks.IDENTIFIER, sbData);
+                }
+            } catch (Throwable ignored) {}
+        }
     }
 
     private void handlePlayerJoin(@NotNull ServerPlayNetworkHandler handler, @NotNull PacketSender sender,

@@ -201,6 +201,14 @@ public class FabricHuskSync implements DedicatedServerModInitializer, HuskSync, 
                         new Serializer.Json<>(this, FabricData.CardinalComponents.class)
                 );
             }
+
+            // Sync Sophisticated Backpacks contents - only if the mod is present
+            if (net.fabricmc.loader.api.FabricLoader.getInstance().isModLoaded("sophisticatedbackpacks")) {
+                registerSerializer(
+                        FabricData.SophisticatedBackpacks.IDENTIFIER,
+                        new Serializer.Json<>(this, FabricData.SophisticatedBackpacks.class)
+                );
+            }
             validateDependencies();
         });
 

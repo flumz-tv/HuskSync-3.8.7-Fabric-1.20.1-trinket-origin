@@ -41,6 +41,25 @@ public interface FabricUserDataHolder extends UserDataHolder {
                     getPlayer(), (net.william278.husksync.FabricHuskSync) getPlugin()));
         }
 
+        // Sophisticated Backpacks: try live capture first, fall back to pre-cache.
+        // BackpackStorage (PersistentState) only returns data on the main thread.
+        // On disconnect, data is pre-cached in the customDataStore by the event
+        // listener (main thread) so the async snapshot creation can find it.
+        if (id.equals(FabricData.SophisticatedBackpacks.IDENTIFIER)) {
+            final FabricData.SophisticatedBackpacks live =
+                    FabricData.SophisticatedBackpacks.adapt(
+                            getPlayer(), (net.william278.husksync.FabricHuskSync) getPlugin());
+            if (live.getBackpacks() != null && !live.getBackpacks().isEmpty()) {
+                return Optional.of(live);
+            }
+            // Live capture empty → check pre-cache (set on disconnect)
+            final Data cached = getCustomDataStore().get(id);
+            if (cached != null) {
+                return Optional.of(cached);
+            }
+            return Optional.of(live); // return empty if nothing cached
+        }
+
         if (id.isCustom()) {
             return Optional.ofNullable(getCustomDataStore().get(id));
         }
